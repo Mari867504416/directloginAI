@@ -492,3 +492,22 @@ app.listen(PORT, () => {
     );
 
 });
+
+browserContext = await chromium.launchPersistentContext(
+    USER_DATA_DIR,
+    {
+        headless: true,
+
+        viewport: {
+            width: 1440,
+            height: 900
+        },
+
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu"
+        ]
+    }
+);
