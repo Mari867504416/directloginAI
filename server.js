@@ -7,18 +7,61 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 
+// Persistent browser profile
 const USER_DATA_DIR = path.join(
     __dirname,
     "auth",
     "user-data"
 );
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+// Gemini URL
+const GEMINI_URL = "https://gemini.google.com/app";
 
+// Global browser context/page
 let browserContext = null;
-let page = null;
-let startingBrowser = null;
+let geminiPage = null;
+let browserStarting = null;
+
+// Prevent simultaneous questions
+let requestRunning = false;
+
+
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
+
+app.use(express.json({
+    limit: "2mb"
+}));
+
+app.use(express.urlencoded({
+    extended: true,
+    limit: "2mb"
+}));
+
+app.use(
+    express.static(
+        path.join(__dirname, "public")
+    )
+);
+
+
+/* =========================================================
+   CREATE USER DATA DIRECTORY
+========================================================= */
+
+function ensureUserDataDirectory() {
+
+    if (!fs.existsSync(USER_DATA_DIR)) {
+
+        fs.mkdirSync(
+            USER_DATA_DIR,
+            {
+                recursive: true
+            }
+        );
+    }
+}
 
 
 /* =========================================================
@@ -27,487 +70,1015 @@ let startingBrowser = null;
 
 async function startGeminiBrowser() {
 
-    if (page && !page.isClosed()) {
-        return page;
+    // Browser already running
+    if (
+        geminiPage &&
+        !geminiPage.isClosed()
+    ) {
+
+        return geminiPage;
     }
 
-    if (startingBrowser) {
-        return startingBrowser;
+
+    // Another request is already starting browser
+    if (browserStarting) {
+
+        return await browserStarting;
     }
 
-    startingBrowser = (async () => {
 
-        console.log("Starting Chromium...");
+    browserStarting = (async () => {
 
-        fs.mkdirSync(USER_DATA_DIR, {
-            recursive: true
-        });
+        try {
 
-        browserContext = await chromium.launchPersistentContext(
-            USER_DATA_DIR,
-            {
-                headless: true,
+            console.log("================================");
+            console.log("Starting Chromium...");
+            console.log("================================");
 
-                viewport: {
-                    width: 1440,
-                    height: 900
-                },
 
-                args: [
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ]
+            ensureUserDataDirectory();
+
+
+            /*
+             * Persistent context is used so that
+             * Google/Gemini session can remain available.
+             */
+
+            browserContext =
+                await chromium.launchPersistentContext(
+                    USER_DATA_DIR,
+                    {
+
+                        headless: true,
+
+                        viewport: {
+                            width: 1440,
+                            height: 900
+                        },
+
+                        args: [
+
+                            "--no-sandbox",
+
+                            "--disable-setuid-sandbox",
+
+                            "--disable-dev-shm-usage",
+
+                            "--disable-gpu",
+
+                            "--disable-software-rasterizer",
+
+                            "--no-first-run",
+
+                            "--no-default-browser-check"
+
+                        ]
+
+                    }
+                );
+
+
+            /*
+             * Use existing page if available
+             */
+
+            const pages =
+                browserContext.pages();
+
+
+            if (pages.length > 0) {
+
+                geminiPage =
+                    pages[0];
+
+            } else {
+
+                geminiPage =
+                    await browserContext.newPage();
+
             }
-        );
 
-        page = await browserContext.newPage();
 
-        console.log("Opening Gemini...");
+            /*
+             * Browser crash handling
+             */
 
-        await page.goto(
-            "https://gemini.google.com/app",
-            {
-                waitUntil: "domcontentloaded",
-                timeout: 120000
+            geminiPage.on(
+                "close",
+                () => {
+
+                    console.log(
+                        "Gemini page closed."
+                    );
+
+                    geminiPage = null;
+                }
+            );
+
+
+            /*
+             * Open Gemini
+             */
+
+            console.log(
+                "Opening Gemini..."
+            );
+
+
+            await geminiPage.goto(
+                GEMINI_URL,
+                {
+                    waitUntil:
+                        "domcontentloaded",
+
+                    timeout:
+                        120000
+                }
+            );
+
+
+            await geminiPage.waitForTimeout(
+                3000
+            );
+
+
+            console.log(
+                "Gemini URL:",
+                geminiPage.url()
+            );
+
+
+            console.log(
+                "Gemini title:",
+                await geminiPage.title()
+                    .catch(() => "")
+            );
+
+
+            return geminiPage;
+
+
+        } catch (error) {
+
+            console.error(
+                "Browser startup error:",
+                error
+            );
+
+            geminiPage = null;
+
+            if (browserContext) {
+
+                await browserContext.close()
+                    .catch(() => {});
+
+                browserContext = null;
             }
-        );
 
-        console.log(
-            "Gemini page loaded:",
-            await page.title()
-        );
+            throw error;
 
-        return page;
+        }
+
     })();
 
+
     try {
-        return await startingBrowser;
+
+        return await browserStarting;
+
     } finally {
-        startingBrowser = null;
+
+        browserStarting = null;
     }
 }
 
 
 /* =========================================================
-   LOGIN STATUS
+   CHECK GOOGLE LOGIN
 ========================================================= */
 
-app.get("/gemini-status", async (req, res) => {
+async function checkGeminiLogin(page) {
 
-    try {
+    const url =
+        page.url();
 
-        const geminiPage = await startGeminiBrowser();
 
-        await geminiPage.waitForTimeout(3000);
+    /*
+     * Google login page
+     */
 
-        const url = geminiPage.url();
+    if (
+        url.includes(
+            "accounts.google.com"
+        )
+    ) {
 
-        const title = await geminiPage.title();
-
-        const loginRequired =
-            url.includes("accounts.google.com") ||
-            (
-                await geminiPage.locator(
-                    'input[type="email"]'
-                ).count()
-            ) > 0;
-
-        res.json({
-            success: true,
-            loggedIn: !loginRequired,
-            url,
-            title
-        });
-
-    } catch (error) {
-
-        console.error(error);
-
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        return false;
     }
-});
+
+
+    /*
+     * Common login input
+     */
+
+    const emailInput =
+        page.locator(
+            'input[type="email"]'
+        );
+
+
+    if (
+        await emailInput.count() > 0
+    ) {
+
+        if (
+            await emailInput
+                .first()
+                .isVisible()
+                .catch(() => false)
+        ) {
+
+            return false;
+        }
+    }
+
+
+    /*
+     * Gemini page itself
+     */
+
+    if (
+        url.includes(
+            "gemini.google.com"
+        )
+    ) {
+
+        return true;
+    }
+
+
+    return false;
+}
+
+
+/* =========================================================
+   FIND GEMINI INPUT
+========================================================= */
+
+async function findGeminiInput(page) {
+
+    const selectors = [
+
+        "textarea",
+
+        'div[role="textbox"]',
+
+        '[contenteditable="true"]',
+
+        'rich-textarea textarea',
+
+        'rich-textarea',
+
+        'div[contenteditable="true"][role="textbox"]'
+
+    ];
+
+
+    for (
+        const selector of selectors
+    ) {
+
+        const locator =
+            page.locator(selector).last();
+
+
+        if (
+            await locator.count() === 0
+        ) {
+
+            continue;
+        }
+
+
+        if (
+            await locator
+                .isVisible()
+                .catch(() => false)
+        ) {
+
+            console.log(
+                "Gemini input found:",
+                selector
+            );
+
+            return locator;
+        }
+    }
+
+
+    return null;
+}
+
+
+/* =========================================================
+   FIND SEND BUTTON
+========================================================= */
+
+async function findSendButton(page) {
+
+    const selectors = [
+
+        'button[aria-label*="Send"]',
+
+        'button[aria-label*="send"]',
+
+        'button[data-testid*="send"]',
+
+        '[data-testid*="send-button"]',
+
+        'button:has-text("Send")'
+
+    ];
+
+
+    for (
+        const selector of selectors
+    ) {
+
+        const locator =
+            page.locator(selector).last();
+
+
+        if (
+            await locator.count() === 0
+        ) {
+
+            continue;
+        }
+
+
+        if (
+            await locator
+                .isVisible()
+                .catch(() => false)
+        ) {
+
+            return locator;
+        }
+    }
+
+
+    return null;
+}
+
+
+/* =========================================================
+   GET RESPONSE TEXT
+========================================================= */
+
+async function getGeminiResponse(page) {
+
+    /*
+     * Possible Gemini response selectors.
+     * Google can change the DOM, so several selectors
+     * are checked.
+     */
+
+    const selectors = [
+
+        "message-content",
+
+        ".model-response-text",
+
+        "[data-message-author-role='model']",
+
+        ".markdown-main-panel",
+
+        "model-response",
+
+        "div[class*='model-response']",
+
+        "div[class*='response-content']"
+
+    ];
+
+
+    let bestText = "";
+
+
+    for (
+        const selector of selectors
+    ) {
+
+        const locator =
+            page.locator(selector);
+
+
+        const count =
+            await locator.count();
+
+
+        if (count === 0) {
+
+            continue;
+        }
+
+
+        for (
+            let i = count - 1;
+            i >= 0;
+            i--
+        ) {
+
+            const element =
+                locator.nth(i);
+
+
+            if (
+                !await element
+                    .isVisible()
+                    .catch(() => false)
+            ) {
+
+                continue;
+            }
+
+
+            const text =
+                await element
+                    .innerText()
+                    .catch(() => "");
+
+
+            if (
+                text &&
+                text.trim().length > bestText.length
+            ) {
+
+                bestText =
+                    text.trim();
+            }
+
+
+            if (
+                bestText.length > 20
+            ) {
+
+                return bestText;
+            }
+        }
+    }
+
+
+    return bestText;
+}
+
+
+/* =========================================================
+   WAIT FOR GEMINI RESPONSE
+========================================================= */
+
+async function waitForGeminiResponse(
+    page,
+    previousText
+) {
+
+    let stableText = "";
+
+    let stableCount = 0;
+
+
+    for (
+        let attempt = 0;
+        attempt < 60;
+        attempt++
+    ) {
+
+        await page.waitForTimeout(
+            1000
+        );
+
+
+        const currentText =
+            await getGeminiResponse(
+                page
+            );
+
+
+        if (
+            currentText &&
+            currentText !== previousText
+        ) {
+
+            /*
+             * Gemini may stream its response.
+             * Wait until the text becomes stable.
+             */
+
+            if (
+                currentText === stableText
+            ) {
+
+                stableCount++;
+
+            } else {
+
+                stableText =
+                    currentText;
+
+                stableCount = 0;
+            }
+
+
+            /*
+             * Response unchanged for 2 seconds
+             */
+
+            if (
+                stableCount >= 2
+            ) {
+
+                return currentText;
+            }
+        }
+    }
+
+
+    return stableText;
+}
+
+
+/* =========================================================
+   STATUS
+========================================================= */
+
+app.get(
+    "/gemini-status",
+    async (req, res) => {
+
+        try {
+
+            const page =
+                await startGeminiBrowser();
+
+
+            const loggedIn =
+                await checkGeminiLogin(
+                    page
+                );
+
+
+            res.json({
+
+                success: true,
+
+                loggedIn,
+
+                url: page.url(),
+
+                title:
+                    await page.title()
+                        .catch(() => "")
+
+            });
+
+
+        } catch (error) {
+
+            console.error(
+                "Status error:",
+                error
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                error:
+                    error.message
+
+            });
+        }
+    }
+);
 
 
 /* =========================================================
    ASK GEMINI
 ========================================================= */
 
-app.post("/ask", async (req, res) => {
+app.post(
+    "/ask",
+    async (req, res) => {
 
-    try {
+        if (requestRunning) {
 
-        const question = String(
-            req.body.question || ""
-        ).trim();
+            return res.status(429).json({
 
-        if (!question) {
-
-            return res.status(400).json({
                 success: false,
-                error: "Question is required"
-            });
-        }
 
-        console.log("\n================================");
-        console.log("Question:", question);
-        console.log("================================");
-
-
-        const geminiPage = await startGeminiBrowser();
-
-
-        /* -----------------------------------------
-           CHECK LOGIN
-        ----------------------------------------- */
-
-        if (
-            geminiPage.url().includes(
-                "accounts.google.com"
-            )
-        ) {
-
-            return res.status(401).json({
-                success: false,
-                loginRequired: true,
                 error:
-                    "Google login is required. Login once in the browser session."
+                    "Another Gemini request is already running. Please wait."
+
             });
         }
 
 
-        /* -----------------------------------------
-           OPEN GEMINI
-        ----------------------------------------- */
+        requestRunning = true;
 
-        if (
-            !geminiPage.url().includes(
-                "gemini.google.com"
-            )
-        ) {
 
-            await geminiPage.goto(
-                "https://gemini.google.com/app",
-                {
-                    waitUntil: "domcontentloaded",
-                    timeout: 120000
-                }
+        try {
+
+            const question =
+                String(
+                    req.body.question || ""
+                ).trim();
+
+
+            if (!question) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    error:
+                        "Question is required."
+
+                });
+            }
+
+
+            console.log("");
+            console.log(
+                "================================"
             );
-        }
+            console.log(
+                "Question:",
+                question
+            );
+            console.log(
+                "================================"
+            );
 
 
-        await geminiPage.waitForTimeout(2000);
+            const page =
+                await startGeminiBrowser();
 
 
-        /* -----------------------------------------
-           FIND TEXTAREA
-        ----------------------------------------- */
+            /* -----------------------------------------
+               CHECK LOGIN
+            ----------------------------------------- */
 
-        const inputSelectors = [
-            "textarea",
-            '[contenteditable="true"]',
-            'div[role="textbox"]'
-        ];
-
-        let input = null;
-
-        for (const selector of inputSelectors) {
-
-            const locator =
-                geminiPage.locator(selector).last();
-
-            if (
-                await locator.count() > 0 &&
-                await locator.isVisible().catch(() => false)
-            ) {
-
-                input = locator;
-
-                console.log(
-                    "Input found:",
-                    selector
+            const loggedIn =
+                await checkGeminiLogin(
+                    page
                 );
 
-                break;
-            }
-        }
 
-
-        if (!input) {
-
-            return res.status(500).json({
-                success: false,
-                loginRequired: true,
-                error:
-                    "Gemini input box was not found. Gemini UI may have changed."
-            });
-        }
-
-
-        /* -----------------------------------------
-           TYPE QUESTION
-        ----------------------------------------- */
-
-        await input.click();
-
-        await input.fill(question);
-
-
-        /* -----------------------------------------
-           SEND
-        ----------------------------------------- */
-
-        const sendSelectors = [
-            'button[aria-label*="Send"]',
-            'button[aria-label*="send"]',
-            'button:has-text("Send")',
-            '[data-testid*="send"]'
-        ];
-
-        let sent = false;
-
-        for (const selector of sendSelectors) {
-
-            const button =
-                geminiPage.locator(selector).last();
-
-            if (
-                await button.count() > 0 &&
-                await button.isVisible().catch(() => false)
-            ) {
-
-                await button.click();
+            if (!loggedIn) {
 
                 console.log(
-                    "Send button clicked:",
-                    selector
+                    "Gemini login is required."
                 );
 
-                sent = true;
 
-                break;
+                return res.status(401).json({
+
+                    success: false,
+
+                    loginRequired: true,
+
+                    error:
+                        "Google login is required for Gemini Web."
+
+                });
             }
-        }
 
 
-        /* -----------------------------------------
-           FALLBACK: ENTER
-        ----------------------------------------- */
+            /* -----------------------------------------
+               MAKE SURE GEMINI PAGE IS OPEN
+            ----------------------------------------- */
 
-        if (!sent) {
+            if (
+                !page.url().includes(
+                    "gemini.google.com"
+                )
+            ) {
+
+                await page.goto(
+                    GEMINI_URL,
+                    {
+                        waitUntil:
+                            "domcontentloaded",
+
+                        timeout:
+                            120000
+                    }
+                );
+
+
+                await page.waitForTimeout(
+                    3000
+                );
+            }
+
+
+            /* -----------------------------------------
+               FIND INPUT
+            ----------------------------------------- */
+
+            const input =
+                await findGeminiInput(
+                    page
+                );
+
+
+            if (!input) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    error:
+                        "Gemini input box was not found. Google may have changed the Gemini Web UI."
+
+                });
+            }
+
+
+            /* -----------------------------------------
+               GET CURRENT RESPONSE
+            ----------------------------------------- */
+
+            const previousResponse =
+                await getGeminiResponse(
+                    page
+                );
+
+
+            /* -----------------------------------------
+               ENTER QUESTION
+            ----------------------------------------- */
+
+            await input.click();
+
+
+            await input.fill(
+                question
+            );
+
 
             console.log(
-                "Send button not found. Pressing Enter..."
+                "Question entered."
             );
 
-            await input.press("Enter");
-        }
+
+            /* -----------------------------------------
+               SEND
+            ----------------------------------------- */
+
+            const sendButton =
+                await findSendButton(
+                    page
+                );
 
 
-        /* -----------------------------------------
-           WAIT FOR GEMINI
-        ----------------------------------------- */
+            if (sendButton) {
 
-        console.log(
-            "Waiting for Gemini response..."
-        );
-
-        await geminiPage.waitForTimeout(3000);
+                await sendButton.click();
 
 
-        /* -----------------------------------------
-           GET RESPONSE
-        ----------------------------------------- */
+                console.log(
+                    "Send button clicked."
+                );
 
-        let answer = "";
+            } else {
 
-        for (
-            let attempt = 0;
-            attempt < 30;
-            attempt++
-        ) {
+                console.log(
+                    "Send button not found."
+                );
 
-            await geminiPage.waitForTimeout(1000);
-
-
-            /*
-             * Gemini's response DOM changes from time
-             * to time, therefore several selectors
-             * are checked.
-             */
-
-            const responseSelectors = [
-
-                "message-content",
-
-                ".model-response-text",
-
-                "[data-message-author-role='model']",
-
-                ".markdown-main-panel",
-
-                "div[class*='response']"
-            ];
+                console.log(
+                    "Trying Enter..."
+                );
 
 
-            for (
-                const selector of responseSelectors
+                await input.press(
+                    "Enter"
+                );
+            }
+
+
+            /* -----------------------------------------
+               WAIT
+            ----------------------------------------- */
+
+            console.log(
+                "Waiting for Gemini response..."
+            );
+
+
+            const answer =
+                await waitForGeminiResponse(
+                    page,
+                    previousResponse
+                );
+
+
+            /* -----------------------------------------
+               CHECK ANSWER
+            ----------------------------------------- */
+
+            if (
+                !answer ||
+                answer.trim().length < 2
             ) {
 
-                const responses =
-                    geminiPage.locator(selector);
+                return res.status(500).json({
 
-                const count =
-                    await responses.count();
+                    success: false,
 
-                if (count === 0) {
-                    continue;
-                }
+                    error:
+                        "Gemini response could not be extracted from the Web UI."
 
-
-                const lastResponse =
-                    responses.last();
-
-
-                if (
-                    await lastResponse.isVisible()
-                        .catch(() => false)
-                ) {
-
-                    const text =
-                        await lastResponse.innerText()
-                            .catch(() => "");
-
-                    if (
-                        text &&
-                        text.trim().length > 10
-                    ) {
-
-                        answer =
-                            text.trim();
-
-                        break;
-                    }
-                }
+                });
             }
 
 
-            if (answer) {
-                break;
-            }
-        }
+            console.log("");
+            console.log(
+                "Gemini Answer:"
+            );
+            console.log(
+                answer
+            );
+            console.log("");
 
 
-        /* -----------------------------------------
-           FALLBACK RESPONSE EXTRACTION
-        ----------------------------------------- */
+            /* -----------------------------------------
+               RETURN FRONTEND RESPONSE
+            ----------------------------------------- */
 
-        if (!answer) {
+            res.json({
 
-            answer = await geminiPage
-                .locator("body")
-                .innerText()
-                .catch(() => "");
-        }
+                success: true,
 
+                question,
 
-        if (!answer) {
+                answer,
 
-            return res.status(500).json({
-                success: false,
-                error:
-                    "Gemini response could not be read."
+                timestamp:
+                    new Date().toISOString()
+
             });
+
+
+        } catch (error) {
+
+            console.error(
+                "Gemini automation error:"
+            );
+
+            console.error(
+                error
+            );
+
+
+            res.status(500).json({
+
+                success: false,
+
+                error:
+                    error.message
+
+            });
+
+
+        } finally {
+
+            requestRunning = false;
         }
+    }
+);
 
 
-        console.log("\nGemini Answer:\n");
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
 
-        console.log(answer);
-
-
-        /* -----------------------------------------
-           SEND TO FRONTEND
-        ----------------------------------------- */
+app.get(
+    "/health",
+    (req, res) => {
 
         res.json({
 
-            success: true,
+            status: "ok",
 
-            question,
+            service:
+                "Gemini Web Automation",
 
-            answer,
+            browserRunning:
+                !!(
+                    geminiPage &&
+                    !geminiPage.isClosed()
+                ),
 
             timestamp:
                 new Date().toISOString()
 
         });
+    }
+);
+
+
+/* =========================================================
+   HOME PAGE
+========================================================= */
+
+app.get(
+    "/",
+    (req, res) => {
+
+        res.sendFile(
+            path.join(
+                __dirname,
+                "public",
+                "index.html"
+            )
+        );
+    }
+);
+
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown() {
+
+    console.log(
+        "Shutting down..."
+    );
+
+
+    try {
+
+        if (browserContext) {
+
+            await browserContext.close();
+
+        }
 
     } catch (error) {
 
         console.error(
-            "Gemini automation error:",
-            error
+            "Browser close error:",
+            error.message
+        );
+    }
+
+
+    process.exit(0);
+}
+
+
+process.on(
+    "SIGTERM",
+    shutdown
+);
+
+process.on(
+    "SIGINT",
+    shutdown
+);
+
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+        console.log("");
+        console.log(
+            "================================"
         );
 
-        res.status(500).json({
+        console.log(
+            `Server running on port ${PORT}`
+        );
 
-            success: false,
+        console.log(
+            `Gemini URL: ${GEMINI_URL}`
+        );
 
-            error: error.message
+        console.log(
+            "================================"
+        );
 
-        });
-    }
-});
-
-
-/* =========================================================
-   HOME
-========================================================= */
-
-app.get("/", (req, res) => {
-
-    res.sendFile(
-        path.join(
-            __dirname,
-            "public",
-            "index.html"
-        )
-    );
-});
-
-
-/* =========================================================
-   SERVER
-========================================================= */
-
-app.listen(PORT, () => {
-
-    console.log(
-        `Server running on port ${PORT}`
-    );
-
-});
-
-browserContext = await chromium.launchPersistentContext(
-    USER_DATA_DIR,
-    {
-        headless: true,
-
-        viewport: {
-            width: 1440,
-            height: 900
-        },
-
-        args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu"
-        ]
     }
 );
