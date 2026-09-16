@@ -1,15 +1,6 @@
-FROM mcr.microsoft.com/playwright:v1.55.0-noble
-
+FROM mcr.microsoft.com/playwright:v1.56.0-jammy
 WORKDIR /app
-
 COPY package*.json ./
-
-RUN npm install
-
+RUN npm ci
 COPY . .
-
-ENV NODE_ENV=production
-
-EXPOSE 10000
-
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
