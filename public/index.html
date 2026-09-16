@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Gemini Web AI</title>
+
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family:
+                Arial,
+                sans-serif;
+
+            background: #f5f7fb;
+        }
+
+        .container {
+
+            width: 90%;
+            max-width: 1000px;
+
+            margin: 40px auto;
+        }
+
+        h1 {
+
+            text-align: center;
+
+            color: #1f3c88;
+        }
+
+        .card {
+
+            background: white;
+
+            padding: 25px;
+
+            border-radius: 12px;
+
+            box-shadow:
+                0 4px 20px
+                rgba(0,0,0,0.08);
+        }
+
+        textarea {
+
+            width: 100%;
+
+            min-height: 150px;
+
+            padding: 15px;
+
+            font-size: 16px;
+
+            border:
+                1px solid #ccc;
+
+            border-radius: 8px;
+
+            resize: vertical;
+        }
+
+        button {
+
+            margin-top: 15px;
+
+            padding:
+                12px 25px;
+
+            background:
+                #1f3c88;
+
+            color: white;
+
+            border: none;
+
+            border-radius: 7px;
+
+            font-size: 16px;
+
+            cursor: pointer;
+        }
+
+        button:hover {
+
+            background:
+                #162e69;
+        }
+
+        button:disabled {
+
+            background: #999;
+
+            cursor: not-allowed;
+        }
+
+        #status {
+
+            margin-top: 15px;
+
+            font-weight: bold;
+        }
+
+        #answer {
+
+            margin-top: 25px;
+
+            padding: 20px;
+
+            background:
+                #f8f9fc;
+
+            border-radius: 8px;
+
+            white-space: pre-wrap;
+
+            line-height: 1.6;
+        }
+
+        .loading {
+
+            color: #555;
+        }
+
+        .error {
+
+            color: #c62828;
+        }
+
+    </style>
+
+</head>
+
+
+<body>
+
+
+<div class="container">
+
+    <h1>
+        Gemini Web AI
+    </h1>
+
+
+    <div class="card">
+
+
+        <textarea
+            id="question"
+            placeholder="Enter your question..."
+        ></textarea>
+
+
+        <br>
+
+
+        <button
+            id="askButton"
+            onclick="askGemini()"
+        >
+            Ask Gemini
+        </button>
+
+
+        <div id="status"></div>
+
+
+        <div id="answer"></div>
+
+
+    </div>
+
+</div>
+
+
+
+<script>
+
+
+async function askGemini() {
+
+
+    const question =
+        document
+        .getElementById("question")
+        .value
+        .trim();
+
+
+    const button =
+        document
+        .getElementById("askButton");
+
+
+    const status =
+        document
+        .getElementById("status");
+
+
+    const answer =
+        document
+        .getElementById("answer");
+
+
+    if (!question) {
+
+        alert(
+            "Please enter a question."
+        );
+
+        return;
+    }
+
+
+    button.disabled = true;
+
+
+    status.className =
+        "loading";
+
+    status.innerText =
+        "Gemini is thinking...";
+
+
+    answer.innerText = "";
+
+
+    try {
+
+
+        const response =
+            await fetch(
+                "/ask",
+                {
+
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify({
+                            question
+                        })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (
+            data.loginRequired
+        ) {
+
+            status.className =
+                "error";
+
+            status.innerText =
+                "Google login is required.";
+
+            return;
+        }
+
+
+        if (
+            !data.success
+        ) {
+
+            throw new Error(
+                data.error ||
+                "Unknown error"
+            );
+        }
+
+
+        status.className = "";
+
+        status.innerText =
+            "Gemini response received";
+
+
+        answer.innerText =
+            data.answer;
+
+
+    } catch (error) {
+
+
+        console.error(error);
+
+
+        status.className =
+            "error";
+
+
+        status.innerText =
+            "Error: " +
+            error.message;
+
+
+    } finally {
+
+
+        button.disabled =
+            false;
+
+    }
+
+}
+
+
+</script>
+
+
+</body>
+
+</html>
