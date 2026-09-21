@@ -1,5 +1,4 @@
 
-
 fetch("https://api.openai.com/v1/models", {
   method: "GET",
   headers: {
